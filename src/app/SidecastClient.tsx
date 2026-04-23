@@ -65,6 +65,8 @@ const PERSONAS: Persona[] = [
 const defaultPersonaStates = (): Record<string, PersonaState> =>
   Object.fromEntries(PERSONAS.map((p) => [p.id, { waveformState: "idle", response: "", visible: false, cooldownUntil: 0 }]));
 
+const DEMO_TRANSCRIPT = `So we had Satya Nadella on last week and he was talking about how GitHub Copilot crossed two million paying developers. The revenue from that one product is already at a one billion dollar run rate. Meanwhile OpenAI is raising at a 300 billion valuation, which is insane when you think about it — they did maybe three billion in revenue last year. That is a hundred times multiple. What does that say about the market? I think it means people genuinely believe AGI is closer than we think, or they are completely delusional. Either way the money is real and the race is very much on.`;
+
 function WaveformCanvas({ state, color, width = 80, height = 28 }: { state: WaveformState; color: string; width?: number; height?: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const frameRef = useRef<number>(0);
@@ -236,6 +238,7 @@ export default function SidecastClient() {
   const recentTranscriptRef = useRef<string[]>([]);
   const personaStatesRef = useRef(personaStates);
   const wordThresholdRef = useRef(wordThreshold);
+  const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
 
   useEffect(() => { personaStatesRef.current = personaStates; }, [personaStates]);
   useEffect(() => { wordThresholdRef.current = wordThreshold; }, [wordThreshold]);
@@ -256,11 +259,16 @@ export default function SidecastClient() {
     const now = Date.now();
     const state = personaStatesRef.current[persona.id];
     if (state.cooldownUntil > now || state.waveformState === "thinking" || state.waveformState === "active") return;
+
+    const ac = new AbortController();
+    abortControllersRef.current.set(persona.id, ac);
+
     setPersonaStates((prev) => ({ ...prev, [persona.id]: { ...prev[persona.id], waveformState: "thinking", response: "", visible: true } }));
     try {
       const res = await fetch("/api/pod", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ transcript, systemPrompt: persona.systemPrompt }),
+        signal: ac.signal,
       });
       if (!res.ok) { const e = await res.json().catch(() => ({ error: "API error" })); throw new Error(e.error ?? `HTTP ${res.status}`); }
       const reader = res.body!.getReader();
@@ -282,8 +290,11 @@ export default function SidecastClient() {
           } catch { /* ignore malformed SSE */ }
         }
       }
+      abortControllersRef.current.delete(persona.id);
       setPersonaStates((prev) => ({ ...prev, [persona.id]: { ...prev[persona.id], waveformState: "idle", response: fullText, cooldownUntil: Date.now() + persona.cooldownMs } }));
     } catch (err) {
+      abortControllersRef.current.delete(persona.id);
+      if (err instanceof Error && err.name === "AbortError") return;
       const msg = err instanceof Error ? err.message : "Unknown error";
       setPersonaStates((prev) => ({ ...prev, [persona.id]: { ...prev[persona.id], waveformState: "idle", response: `⚠ ${msg.slice(0, 80)}`, cooldownUntil: Date.now() + 5000 } }));
     }
@@ -353,8 +364,24 @@ export default function SidecastClient() {
   }, []);
 
   const clearAll = useCallback(() => {
+    abortControllersRef.current.forEach((ac) => ac.abort());
+    abortControllersRef.current.clear();
     setSegments([]); setInterimText(""); recentTranscriptRef.current = []; newWordCountRef.current = 0; setPersonaStates(defaultPersonaStates());
   }, []);
+
+  const runDemo = useCallback(() => {
+    clearAll();
+    const seg: TranscriptSegment = {
+      id: `demo-${Date.now()}`,
+      text: DEMO_TRANSCRIPT,
+      timestamp: Date.now(),
+      isFinal: true,
+    };
+    setSegments([seg]);
+    recentTranscriptRef.current = [DEMO_TRANSCRIPT];
+    newWordCountRef.current = 0;
+    triggerPersonas(DEMO_TRANSCRIPT);
+  }, [clearAll, triggerPersonas]);
 
   useEffect(() => {
     return () => {
@@ -432,6 +459,14 @@ export default function SidecastClient() {
               className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-semibold text-sm transition-all ${isListening ? "bg-red-500 hover:bg-red-400 text-white shadow-lg shadow-red-500/20" : "bg-pink-500 hover:bg-pink-400 text-white shadow-lg shadow-pink-500/20"}`}>
               {isListening ? (<><MicOff className="w-4 h-4" />Stop Listening</>) : (<><Mic className="w-4 h-4" />Start Listening</>)}
             </button>
+            {!isListening && (
+              <button
+                onClick={runDemo}
+                className="flex items-center gap-1.5 px-4 py-2.5 rounded-lg text-sm font-medium border border-neutral-700 text-neutral-300 hover:text-white hover:border-neutral-500 transition-all"
+              >
+                ▶ Try Demo
+              </button>
+            )}
             {segments.length > 0 && <button onClick={clearAll} className="px-4 py-2.5 text-sm text-neutral-500 hover:text-white transition-colors">Clear</button>}
             <div className="ml-auto text-right hidden sm:block">
               <div className="text-xs text-neutral-600">{audioMode === "tab" ? "Pick your tab → check 'Share tab audio'" : "Captures microphone input"}</div>
@@ -452,8 +487,38 @@ export default function SidecastClient() {
         </div>
 
         <div className="lg:w-80 flex flex-col gap-3">
-          <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider px-1">AI Commentators</div>
+          <div className="flex items-center justify-between px-1">
+            <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">AI Commentators</div>
+            <button
+              onClick={() => { if (recentTranscriptRef.current.length > 0) triggerPersonas(recentTranscriptRef.current.join(" ")); }}
+              disabled={segments.length === 0}
+              title="Trigger all personas with current transcript"
+              className="text-xs text-neutral-600 hover:text-pink-400 transition-colors disabled:opacity-30 disabled:cursor-not-allowed px-2 py-1 rounded hover:bg-neutral-800"
+            >
+              React now ↑
+            </button>
+          </div>
           {PERSONAS.map((persona) => <PersonaCard key={persona.id} persona={persona} state={personaStates[persona.id]} />)}
+
+          <a
+            href="https://twitter.com/twistartups"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-2 p-3 bg-neutral-900 rounded-xl border border-neutral-800 hover:border-neutral-700 transition-colors mt-1 group"
+          >
+            <div className="w-7 h-7 rounded-full bg-cyan-400/10 border border-cyan-400/20 flex items-center justify-center flex-shrink-0">
+              <span className="text-xs">🎙</span>
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-xs font-semibold text-neutral-300 group-hover:text-white transition-colors">
+                Featured by TWiST
+              </div>
+              <div className="text-xs text-neutral-600 truncate">
+                @twistartups · AI Sidebar Challenge
+              </div>
+            </div>
+            <ChevronRight className="w-3.5 h-3.5 text-neutral-600 flex-shrink-0" />
+          </a>
         </div>
       </main>
 
